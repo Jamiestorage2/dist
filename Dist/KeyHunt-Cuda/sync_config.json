@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "server_url": "https://client.intercomserviceslondon.co.uk/wp-json/keyhunt/v1",
+  "api_key": "gtHtVP99sNkrveHjfXgLJWijv7nmVd9j",
+  "client_id": "ce82a369",
+  "client_name": "Main My PC ",
+  "auto_sync_interval": 300
+}

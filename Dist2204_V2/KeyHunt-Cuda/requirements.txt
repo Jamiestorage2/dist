@@ -1,0 +1,11 @@
+# KeyHunt Visualizer v3.0 - Python Dependencies
+# Install with: pip3 install -r requirements.txt
+
+# HTTP library for pool scraping
+requests>=2.25.0
+
+# HTML parsing for pool data extraction
+beautifulsoup4>=4.9.0
+
+# Fast XML/HTML parser (optional but recommended)
+lxml>=4.6.0

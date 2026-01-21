@@ -1,1 +1,69 @@
 curl -fsSL https://claude.ai/install.sh | bash
+
+
+Things to check in the code, as this is the expected workflow. 
+
+
+Keyhunt visualizer syncs with command and control. 
+
+On sync it sends all blocks scanned.
+On sync it sends all key ranges sent with any key ranges it skipped or missed. 
+On sync it will send any pool scraped blocks 
+On sync it will send all key ranges scanned by pool 
+
+On sync it receives blocks scanned.
+On sync it receives all key ranges scanned from any other visualizer instance and also browser plugin instances 
+On sync it will receives any pool scraped blocks 
+On sync it will receive all key ranges scanned by pool 
+By doing so all instances and the server stay in sync within a reasonable 0-300 seconds 
+
+The reason is, we are scanning different sizes of keyspace and calling that 1 block. The browser is 1000k keys per block 
+The pool is 35,184,372,088,831 keys per block
+Our keyhunt visualizer is random depending on the size of block we decide to scan. 
+
+I need the server to be able to understand all of this dynamically and ensure not a single key is missed or duplicate. 
+
+
+The following is from the pool: 
+
+
+
+Range
+0x53X0428
+
+Worker
+VAST0_4070S
+
+Range
+53X0428-53X0428
+
+Start time
+2026-01-21T11:38:20.78
+
+End time
+2026-01-21T18:46:46.0466667
+
+Scanned in
+428.4 minute(s)
+
+Total keys
+35,184,372,088,831 keys
+
+Scan rate
+1.37B key/second
+
+Status
+Completed 2 minute(s) ago
+
+This is what I would like to be synced between the visualizer and the server and to be able to see who has scanned what section of keyspace and when 
+
+You will also see i have a new script for installing onto ubuntu 22.04 this version is to be distributed to team members we need to ensure that if a team member finds the private key its displayed on the server and also synced to this version we are running locally. 
+
+So im essence i am the master
+2204 users are my team 
+We are all synced via the server
+Only I am made aware of found private keys. 
+Found.txt is only created on my local master not on 2204 user's in the team. 
+The server must also be notified and display the private key on the server admin panel. 
+
+Issues I have noticed are that user id change in the 2204 team version stops me editing the username. It also means I dont see it on the server as a user. Look into this. 

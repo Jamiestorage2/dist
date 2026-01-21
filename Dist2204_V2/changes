@@ -1,0 +1,6 @@
+Multi-GPU support (1 process per GPU)                                                                     
+  - Single GPU = single block mode                                                                            
+  - Auto GPU detection at startup                                                                             
+  - Comprehensive setup.sh with NVIDIA/CUDA install                                                           
+  - Sync config with 90 second interval                                                                       
+  - "Now Scanning" status bar 

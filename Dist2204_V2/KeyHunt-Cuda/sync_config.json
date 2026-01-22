@@ -2,7 +2,8 @@
   "enabled": true,
   "server_url": "https://client.intercomserviceslondon.co.uk/wp-json/keyhunt/v1",
   "api_key": "gtHtVP99sNkrveHjfXgLJWijv7nmVd9j",
-  "client_id": "",
-  "client_name": "",
-  "auto_sync_interval": 90
+  "client_id": "25711dc7",
+  "client_name": "Team-server-H110M-S2H",
+  "auto_sync_interval": 90,
+  "is_master": false
 }

